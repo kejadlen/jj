@@ -356,6 +356,9 @@ Thanks to the people who made this release happen!
 * `jj resolve` now accepts new built-in merge tools `:ours` and `:theirs`.
   These merge tools accept side #1 and side #2 of the conflict respectively.
 
+* Add support for just ignoring Git LFS files by parsing `.gitattribute` files
+  and automatically adding the relevant files to the internal ignore list
+
 ### Fixed bugs
 
 * `jj log -p --stat` now shows diff stats as well as the default color-words/git
