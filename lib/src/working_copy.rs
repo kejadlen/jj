@@ -211,7 +211,7 @@ pub struct SnapshotOptions<'a> {
     // long-lived process.
     pub base_ignores: Arc<GitIgnoreFile>,
     /// Used for ignoring LFS files - if the setting isn't enabled, this is None
-    pub base_attributes: Option<Arc<GitAttributesFile>>,
+    pub base_attributes: Arc<GitAttributesFile>,
     /// The fsmonitor (e.g. Watchman) to use, if any.
     // TODO: Should we make this a field on `LocalWorkingCopy` instead since it's quite specific to
     // that implementation?
@@ -236,7 +236,7 @@ impl SnapshotOptions<'_> {
     pub fn empty_for_test() -> Self {
         SnapshotOptions {
             base_ignores: GitIgnoreFile::empty(),
-            base_attributes: None,
+            base_attributes: Arc::new(GitAttributesFile::default()),
             fsmonitor_settings: FsmonitorSettings::None,
             progress: None,
             start_tracking_matcher: &EverythingMatcher,

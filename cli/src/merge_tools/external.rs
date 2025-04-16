@@ -379,7 +379,7 @@ pub fn edit_diff_external(
     matcher: &dyn Matcher,
     instructions: Option<&str>,
     base_ignores: Arc<GitIgnoreFile>,
-    base_attributes: Option<Arc<GitAttributesFile>>,
+    base_attributes: Arc<GitAttributesFile>,
     default_conflict_marker_style: ConflictMarkerStyle,
 ) -> Result<MergedTreeId, DiffEditError> {
     let conflict_marker_style = editor
