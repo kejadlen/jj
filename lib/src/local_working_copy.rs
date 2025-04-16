@@ -1346,8 +1346,8 @@ impl FileSnapshotter<'_> {
             }
         }
 
-        // We want to ignore these regardless of whether or not they're new files
-        if git_attributes.matches(path.as_internal_file_string()) {
+        // Always ignore LFS files
+        if git_attributes.matches(path.as_internal_file_string(), "filter", "lfs") {
             return Ok(None);
         }
 
@@ -1458,7 +1458,9 @@ impl FileSnapshotter<'_> {
             // Whether or not the entry exists, submodule should be ignored
             .filter(|(_, state)| state.file_type != FileType::GitSubmodule)
             // Ignore LFS entries
-            .filter(|(path, _)| !git_attributes.matches(path.as_internal_file_string()))
+            .filter(|(path, _)| {
+                !git_attributes.matches(path.as_internal_file_string(), "filter", "lfs")
+            })
             .filter(|(path, _)| self.matcher.matches(path))
             .try_for_each(|(path, _)| self.deleted_files_tx.send(path.to_owned()))
             .ok();
