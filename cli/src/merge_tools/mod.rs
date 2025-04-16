@@ -515,7 +515,7 @@ mod tests {
                 name,
                 &settings,
                 GitIgnoreFile::empty(),
-                None,
+                Arc::new(GitAttributesFile::default()),
                 ConflictMarkerStyle::Diff,
             )
             .map(|editor| editor.tool)
@@ -593,7 +593,7 @@ mod tests {
                 &ui,
                 &settings,
                 GitIgnoreFile::empty(),
-                None,
+                Arc::new(GitAttributesFile::default()),
                 ConflictMarkerStyle::Diff,
             )
             .map(|editor| editor.tool)
