@@ -84,7 +84,7 @@ impl GitAttributesFile {
         }
     }
 
-    pub fn matches(&self, path: &str) -> bool {
+    pub fn matches(&self, path: &str, selection: &str, state: &str) -> bool {
         // If path ends with slash, consider it as a directory.
         let (path, is_dir) = match path.strip_suffix('/') {
             Some(path) => (path, true),
@@ -92,7 +92,7 @@ impl GitAttributesFile {
         };
 
         let mut out = gix_attrs::search::Outcome::default();
-        out.initialize_with_selection(&self.collection, ["filter"]);
+        out.initialize_with_selection(&self.collection, [selection]);
         self.search.pattern_matching_relative_path(
             path.into(),
             gix_glob::pattern::Case::Sensitive,
@@ -109,7 +109,7 @@ impl GitAttributesFile {
                     None
                 }
             })
-            .any(|value| value == "lfs");
+            .any(|value| value == state);
         is_lfs
     }
 }
