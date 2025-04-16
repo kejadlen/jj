@@ -67,7 +67,6 @@ pub struct GitSettings {
     pub subprocess: bool,
     pub executable_path: PathBuf,
     pub write_change_id_header: bool,
-    pub ignore_lfs_files: bool,
 }
 
 impl GitSettings {
@@ -79,10 +78,6 @@ impl GitSettings {
             subprocess: settings.get_bool("git.subprocess")?,
             executable_path: settings.get("git.executable-path")?,
             write_change_id_header: settings.get("git.write-change-id-header")?,
-            ignore_lfs_files: settings
-                .get_bool("git.ignore-lfs-files")
-                .optional()?
-                .unwrap_or_default(),
         })
     }
 }
@@ -96,7 +91,6 @@ impl Default for GitSettings {
             subprocess: true,
             executable_path: PathBuf::from("git"),
             write_change_id_header: false,
-            ignore_lfs_files: false,
         }
     }
 }

@@ -1129,7 +1129,7 @@ struct DirectoryToVisit<'a> {
     dir: RepoPathBuf,
     disk_dir: PathBuf,
     git_ignore: Arc<GitIgnoreFile>,
-    git_attributes: Option<Arc<GitAttributesFile>>,
+    git_attributes: Arc<GitAttributesFile>,
     file_states: FileStates<'a>,
 }
 
@@ -1202,14 +1202,10 @@ impl FileSnapshotter<'_> {
 
         let git_ignore = git_ignore
             .chain_with_file(&dir.to_internal_dir_string(), disk_dir.join(".gitignore"))?;
-        let git_attributes = git_attributes
-            .map(|ga| {
-                ga.chain_with_file(
-                    &&dir.to_internal_dir_string(),
-                    disk_dir.join(".gitattributes"),
-                )
-            })
-            .transpose()?;
+        let git_attributes = git_attributes.chain_with_file(
+            &dir.to_internal_dir_string(),
+            disk_dir.join(".gitattributes"),
+        )?;
         let dir_entries: Vec<_> = disk_dir
             .read_dir()
             .and_then(|entries| entries.try_collect())
@@ -1248,7 +1244,7 @@ impl FileSnapshotter<'_> {
         &'scope self,
         dir: &RepoPath,
         git_ignore: &Arc<GitIgnoreFile>,
-        git_attributes: &Option<Arc<GitAttributesFile>>,
+        git_attributes: &Arc<GitAttributesFile>,
         file_states: FileStates<'scope>,
         entry: &DirEntry,
         scope: &rayon::Scope<'scope>,
@@ -1332,13 +1328,7 @@ impl FileSnapshotter<'_> {
         }
 
         // We want to ignore these regardless of whether or not they're new files
-        if git_attributes
-            .as_ref()
-            .map(|ga| ga.matches(path.as_internal_file_string()))
-            .unwrap_or(false)
-        {
-            // git_attributes only exists if we want to ignore LFS files, so if it matches,
-            // then ignore it.
+        if git_attributes.matches(path.as_internal_file_string()) {
             return Ok(None);
         }
 
@@ -1425,7 +1415,7 @@ impl FileSnapshotter<'_> {
         dir: &RepoPath,
         file_states: FileStates<'_>,
         present_entries: &PresentDirEntries,
-        git_attributes: &Option<Arc<GitAttributesFile>>,
+        git_attributes: &Arc<GitAttributesFile>,
     ) {
         let file_state_chunks = file_states.iter().chunk_by(|(path, _state)| {
             // Extract <name> from <dir>, <dir>/<name>, or <dir>/<name>/**.
@@ -1449,12 +1439,7 @@ impl FileSnapshotter<'_> {
             // Whether or not the entry exists, submodule should be ignored
             .filter(|(_, state)| state.file_type != FileType::GitSubmodule)
             // Ignore LFS entries
-            .filter(|(path, _)| {
-                !git_attributes
-                    .as_ref()
-                    .map(|ga| ga.matches(path.as_internal_file_string()))
-                    .unwrap_or(false)
-            })
+            .filter(|(path, _)| !git_attributes.matches(path.as_internal_file_string()))
             .filter(|(path, _)| self.matcher.matches(path))
             .try_for_each(|(path, _)| self.deleted_files_tx.send(path.to_owned()))
             .ok();
