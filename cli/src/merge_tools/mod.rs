@@ -228,7 +228,7 @@ pub fn get_external_tool_config(
 pub struct DiffEditor {
     tool: DiffTool,
     base_ignores: Arc<GitIgnoreFile>,
-    base_attributes: Option<Arc<GitAttributesFile>>,
+    base_attributes: Arc<GitAttributesFile>,
     use_instructions: bool,
     conflict_marker_style: ConflictMarkerStyle,
 }
@@ -240,7 +240,7 @@ impl DiffEditor {
         name: &str,
         settings: &UserSettings,
         base_ignores: Arc<GitIgnoreFile>,
-        base_attributes: Option<Arc<GitAttributesFile>>,
+        base_attributes: Arc<GitAttributesFile>,
         conflict_marker_style: ConflictMarkerStyle,
     ) -> Result<Self, MergeToolConfigError> {
         let tool = DiffTool::get_tool_config(settings, name)?
@@ -259,7 +259,7 @@ impl DiffEditor {
         ui: &Ui,
         settings: &UserSettings,
         base_ignores: Arc<GitIgnoreFile>,
-        base_attributes: Option<Arc<GitAttributesFile>>,
+        base_attributes: Arc<GitAttributesFile>,
         conflict_marker_style: ConflictMarkerStyle,
     ) -> Result<Self, MergeToolConfigError> {
         let args = editor_args_from_settings(ui, settings, "ui.diff-editor")?;
@@ -282,7 +282,7 @@ impl DiffEditor {
         tool: DiffTool,
         settings: &UserSettings,
         base_ignores: Arc<GitIgnoreFile>,
-        base_attributes: Option<Arc<GitAttributesFile>>,
+        base_attributes: Arc<GitAttributesFile>,
         conflict_marker_style: ConflictMarkerStyle,
     ) -> Result<Self, MergeToolConfigError> {
         Ok(DiffEditor {

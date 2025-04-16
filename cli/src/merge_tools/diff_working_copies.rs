@@ -294,7 +294,7 @@ diff editing in mind and be a little inaccurate.
     pub fn snapshot_results(
         self,
         base_ignores: Arc<GitIgnoreFile>,
-        base_attributes: Option<Arc<GitAttributesFile>>,
+        base_attributes: Arc<GitAttributesFile>,
         conflict_marker_style: ConflictMarkerStyle,
     ) -> Result<MergedTreeId, DiffEditError> {
         if let Some(path) = self.instructions_path_to_cleanup {
