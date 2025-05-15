@@ -35,9 +35,19 @@ pub enum GitAttributesError {
 pub struct GitAttributesFile {
     search: gix_attrs::Search,
     collection: gix_attrs::search::MetadataCollection,
+    ignore_filters: Vec<String>,
 }
 
 impl GitAttributesFile {
+    pub fn new(ignore_filters: &[String]) -> Self {
+        let base_attributes = Self::default();
+
+        GitAttributesFile {
+            ignore_filters: ignore_filters.to_vec(),
+            ..base_attributes
+        }
+    }
+
     pub fn chain(
         self: &Arc<GitAttributesFile>,
         prefix: PathBuf,
@@ -48,8 +58,15 @@ impl GitAttributesFile {
 
         let mut search = self.search.clone();
         let mut collection = self.collection.clone();
+        let ignore_filters = self.ignore_filters.clone();
+
         search.add_patterns_buffer(input, source_file, Some(&prefix), &mut collection, true);
-        Ok(Arc::new(GitAttributesFile { search, collection }))
+
+        Ok(Arc::new(GitAttributesFile {
+            search,
+            collection,
+            ignore_filters,
+        }))
     }
 
     /// Concatenates new `.gitattributes` file.
@@ -65,6 +82,8 @@ impl GitAttributesFile {
             let mut buf = Vec::new();
             let mut search = self.search.clone();
             let mut collection = self.collection.clone();
+            let ignore_filters = self.ignore_filters.clone();
+
             search
                 .add_patterns_file(
                     file.clone(),
@@ -78,13 +97,17 @@ impl GitAttributesFile {
                     path: file.clone(),
                     source: err,
                 })?;
-            Ok(Arc::new(GitAttributesFile { search, collection }))
+            Ok(Arc::new(GitAttributesFile {
+                search,
+                collection,
+                ignore_filters,
+            }))
         } else {
             Ok(self.clone())
         }
     }
 
-    pub fn matches_assignment(&self, path: &str, selection: &str, state: &str) -> bool {
+    pub fn matches(&self, path: &str) -> bool {
         // If path ends with slash, consider it as a directory.
         let (path, is_dir) = match path.strip_suffix('/') {
             Some(path) => (path, true),
@@ -92,7 +115,7 @@ impl GitAttributesFile {
         };
 
         let mut out = gix_attrs::search::Outcome::default();
-        out.initialize_with_selection(&self.collection, [selection]);
+        out.initialize_with_selection(&self.collection, ["filter"]);
         self.search.pattern_matching_relative_path(
             path.into(),
             gix_glob::pattern::Case::Sensitive,
@@ -100,7 +123,7 @@ impl GitAttributesFile {
             &mut out,
         );
 
-        let is_lfs = out
+        let matched = out
             .iter_selected()
             .filter_map(|attr| {
                 if let gix_attrs::StateRef::Value(value_ref) = attr.assignment.state {
@@ -109,8 +132,8 @@ impl GitAttributesFile {
                     None
                 }
             })
-            .any(|value| value == state);
-        is_lfs
+            .any(|value| self.ignore_filters.iter().any(|state| value == state));
+        matched
     }
 }
 
@@ -134,8 +157,13 @@ impl Default for GitAttributesFile {
         let mut collection = gix_attrs::search::MetadataCollection::default();
         let search = gix_attrs::Search::new_globals(files, &mut buf, &mut collection)
             .unwrap_or_else(|_| gix_attrs::Search::default());
+        let ignore_filters = Vec::new();
 
-        GitAttributesFile { search, collection }
+        GitAttributesFile {
+            search,
+            collection,
+            ignore_filters,
+        }
     }
 }
 
@@ -143,103 +171,112 @@ impl Default for GitAttributesFile {
 mod tests {
     use super::*;
 
-    fn matches(input: &[u8], path: &str, selection: &str, state: &str) -> bool {
-        let file = Arc::new(GitAttributesFile::default())
+    fn matches(input: &[u8], path: &str) -> bool {
+        let file = Arc::new(GitAttributesFile::new(&["lfs".to_string()]))
             .chain(PathBuf::new(), input)
             .unwrap();
-        file.matches_assignment(path, selection, state)
+        file.matches(path)
     }
 
     #[test]
     fn test_gitattributes_empty_file() {
-        let file = GitAttributesFile::default();
-        assert!(!file.matches_assignment("foo", "filter", "lfs"));
+        let file = GitAttributesFile::new(&["lfs".to_string()]);
+        assert!(!file.matches("foo"));
     }
 
     #[test]
     fn test_gitattributes_simple_match() {
-        assert!(matches(b"*.bin filter=lfs\n", "file.bin", "filter", "lfs"));
-        assert!(!matches(b"*.bin filter=lfs\n", "file.txt", "filter", "lfs"));
-        assert!(!matches(
-            b"*.bin filter=lfs\n",
-            "file.bin",
-            "filter",
-            "other"
-        ));
-        assert!(!matches(b"*.bin filter=lfs\n", "file.bin", "diff", "lfs"));
+        assert!(matches(b"*.bin filter=lfs\n", "file.bin"));
+        assert!(!matches(b"*.bin filter=lfs\n", "file.txt"));
+        assert!(!matches(b"*.bin filter=other\n", "file.bin"));
     }
 
     #[test]
     fn test_gitattributes_directory_match() {
-        assert!(matches(
-            b"dir/ filter=lfs\n",
-            "dir/file.txt",
-            "filter",
-            "lfs"
-        ));
-        assert!(matches(b"dir/ filter=lfs\n", "dir/", "filter", "lfs"));
-        assert!(!matches(
-            b"dir/ filter=lfs\n",
-            "other/file.txt",
-            "filter",
-            "lfs"
-        ));
-        assert!(!matches(b"dir/ filter=lfs\n", "dir", "filter", "lfs"));
+        assert!(matches(b"dir/ filter=lfs\n", "dir/file.txt"));
+        assert!(matches(b"dir/ filter=lfs\n", "dir/"));
+        assert!(!matches(b"dir/ filter=lfs\n", "other/file.txt"));
+        assert!(!matches(b"dir/ filter=lfs\n", "dir"));
     }
 
     #[test]
     fn test_gitattributes_path_match() {
         assert!(matches(
             b"path/to/file.bin filter=lfs\n",
-            "path/to/file.bin",
-            "filter",
-            "lfs"
+            "path/to/file.bin"
         ));
-        assert!(!matches(
-            b"path/to/file.bin filter=lfs\n",
-            "path/file.bin",
-            "filter",
-            "lfs"
-        ));
+        assert!(!matches(b"path/to/file.bin filter=lfs\n", "path/file.bin"));
     }
 
     #[test]
     fn test_gitattributes_wildcard_match() {
-        assert!(matches(b"*.bin filter=lfs\n", "file.bin", "filter", "lfs"));
-        assert!(matches(b"file.* filter=lfs\n", "file.bin", "filter", "lfs"));
-        assert!(matches(
-            b"**/file.bin filter=lfs\n",
-            "path/to/file.bin",
-            "filter",
-            "lfs"
-        ));
+        assert!(matches(b"*.bin filter=lfs\n", "file.bin"));
+        assert!(matches(b"file.* filter=lfs\n", "file.bin"));
+        assert!(matches(b"**/file.bin filter=lfs\n", "path/to/file.bin"));
     }
 
     #[test]
     fn test_gitattributes_multiple_attributes() {
         let input = b"*.bin filter=lfs diff=binary\n";
-        assert!(matches(input, "file.bin", "filter", "lfs"));
-        assert!(matches(input, "file.bin", "diff", "binary"));
-        assert!(!matches(input, "file.bin", "other", "value"));
+        assert!(matches(input, "file.bin"));
+        assert!(!matches(b"*.bin diff=binary\n", "file.bin")); // Only testing filter=lfs
     }
 
     #[test]
     fn test_gitattributes_chained_files() {
-        let base = Arc::new(GitAttributesFile::default());
+        let base = Arc::new(GitAttributesFile::new(&[
+            "lfs".to_string(),
+            "text".to_string(),
+        ]));
         let with_first = base.chain(PathBuf::new(), b"*.bin filter=lfs\n").unwrap();
         let with_second = with_first
             .chain(PathBuf::from("subdir"), b"*.txt filter=text\n")
             .unwrap();
+        dbg!(&with_second);
 
-        assert!(with_second.matches_assignment("file.bin", "filter", "lfs"));
-        assert!(with_second.matches_assignment("subdir/file.txt", "filter", "text"));
-        assert!(!with_second.matches_assignment("file.txt", "filter", "text"));
+        assert!(with_second.matches("file.bin"));
+        assert!(with_second.matches("subdir/file.txt"));
+        assert!(!with_second.matches("file.txt")); // Not in subdir
     }
 
     #[test]
     fn test_gitattributes_negated_pattern() {
         let input = b"*.bin filter=lfs\n!important.bin filter=lfs\n";
-        assert!(matches(input, "file.bin", "filter", "lfs"));
-        assert!(!matches(input, "important.bin", "filter", "lfs"));
+        assert!(matches(input, "file.bin"));
+        assert!(!matches(input, "important.bin"));
+    }
+
+    #[test]
+    fn test_gitattributes_multiple_filters() {
+        // Create a GitAttributesFile with both "lfs" and "git-crypt" as ignore filters
+        let file = Arc::new(GitAttributesFile::new(&[
+            "lfs".to_string(),
+            "git-crypt".to_string(),
+        ]));
+
+        // Test with lfs filter
+        let with_lfs = file.chain(PathBuf::new(), b"*.bin filter=lfs\n").unwrap();
+        assert!(with_lfs.matches("file.bin"));
+
+        // Test with git-crypt filter
+        let with_git_crypt = file
+            .chain(PathBuf::new(), b"*.secret filter=git-crypt\n")
+            .unwrap();
+        assert!(with_git_crypt.matches("credentials.secret"));
+
+        // Test with both filters in the same file
+        let with_both = file
+            .chain(
+                PathBuf::new(),
+                b"*.bin filter=lfs\n*.secret filter=git-crypt\n",
+            )
+            .unwrap();
+        assert!(with_both.matches("file.bin"));
+        assert!(with_both.matches("credentials.secret"));
+        assert!(!with_both.matches("normal.txt"));
+
+        // Test that other filters don't match
+        let with_other = file.chain(PathBuf::new(), b"*.txt filter=other\n").unwrap();
+        assert!(!with_other.matches("file.txt"));
     }
 }
