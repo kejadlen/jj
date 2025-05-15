@@ -1394,7 +1394,7 @@ to the current parents may contain changes from multiple commits.
         start_tracking_matcher: &'a dyn Matcher,
     ) -> Result<SnapshotOptions<'a>, CommandError> {
         let base_ignores = self.base_ignores()?;
-        let base_attributes = self.base_attributes();
+        let base_attributes = self.base_attributes()?;
         let fsmonitor_settings = self.settings().fsmonitor_settings()?;
         let HumanByteSize(mut max_new_file_size) = self
             .settings()
@@ -1473,8 +1473,10 @@ to the current parents may contain changes from multiple commits.
 
     #[cfg(feature = "git")]
     #[instrument(skip_all)]
-    pub fn base_attributes(&self) -> Arc<GitAttributesFile> {
-        Arc::new(GitAttributesFile::default())
+    pub fn base_attributes(&self) -> Result<Arc<GitAttributesFile>, ConfigGetError> {
+        Ok(Arc::new(GitAttributesFile::new(
+            &self.settings().git_settings()?.ignore_filters,
+        )))
     }
 
     /// Creates textual diff renderer of the specified `formats`.
@@ -1517,7 +1519,7 @@ to the current parents may contain changes from multiple commits.
         tool_name: Option<&str>,
     ) -> Result<DiffEditor, CommandError> {
         let base_ignores = self.base_ignores()?;
-        let base_attributes = self.base_attributes();
+        let base_attributes = self.base_attributes()?;
         let conflict_marker_style = self.env.conflict_marker_style();
         if let Some(name) = tool_name {
             Ok(DiffEditor::with_name(
