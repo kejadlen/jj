@@ -18,21 +18,21 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::ErrorKind;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use gix_attributes::Search;
 use gix_attributes::State;
 use gix_attributes::glob::pattern::Case;
 use gix_attributes::search::MetadataCollection;
 use gix_attributes::search::Outcome;
-use tokio::io::AsyncRead;
+use pollster::FutureExt as _;
 use tokio::io::AsyncReadExt as _;
-use tokio::sync::OnceCell;
 
 use crate::backend::TreeValue;
-use crate::file_util::BlockingAsyncReader;
 use crate::merge::SameChange;
 use crate::merged_tree::MergedTree;
 use crate::repo_path::RepoPath;
@@ -52,15 +52,14 @@ pub(crate) struct GitAttributes {
     node_cache: Mutex<HashMap<RepoPathBuf, Arc<GitAttributesNode>>>,
 }
 
-#[async_trait::async_trait]
 pub(crate) trait FileLoader: Send + Sync {
     /// Loads a file in a given `path`
     ///
     /// Returns Some(..) if the file was found and None if not
-    async fn load(
+    fn load(
         &self,
         path: &RepoPath,
-    ) -> Result<Option<Box<dyn AsyncRead + Send + Unpin>>, GitAttributesError>;
+    ) -> Result<Option<Box<dyn Read + Send>>, GitAttributesError>;
 }
 
 pub(crate) struct TreeFileLoader {
@@ -72,20 +71,19 @@ impl TreeFileLoader {
     }
 }
 
-#[async_trait::async_trait]
 impl FileLoader for TreeFileLoader {
-    async fn load(
+    fn load(
         &self,
         path: &RepoPath,
-    ) -> Result<Option<Box<dyn AsyncRead + Send + Unpin>>, GitAttributesError> {
-        let merged_tree_value =
-            self.tree
-                .path_value(path)
-                .await
-                .map_err(|err| GitAttributesError {
-                    message: "Could not retrieve the value from path".to_string(),
-                    source: err.into(),
-                })?;
+    ) -> Result<Option<Box<dyn Read + Send>>, GitAttributesError> {
+        let merged_tree_value = self
+            .tree
+            .path_value(path)
+            .block_on()
+            .map_err(|err| GitAttributesError {
+                message: "Could not retrieve the value from path".to_string(),
+                source: Arc::from(err),
+            })?;
         let maybe_file_merge = merged_tree_value.to_file_merge();
         // try to resolve the file
         let id = match maybe_file_merge
@@ -108,16 +106,24 @@ impl FileLoader for TreeFileLoader {
             }
         };
 
-        let result =
-            self.tree
-                .store()
-                .read_file(path, id)
-                .await
-                .map_err(|err| GitAttributesError {
-                    message: "Could not retrieve the value from path".to_string(),
-                    source: err.into(),
-                })?;
-        Ok(Some(Box::new(result)))
+        let mut reader = self
+            .tree
+            .store()
+            .read_file(path, id)
+            .block_on()
+            .map_err(|err| GitAttributesError {
+                message: "Could not retrieve the value from path".to_string(),
+                source: Arc::from(err),
+            })?;
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .block_on()
+            .map_err(|err| GitAttributesError {
+                message: "Could not read file contents".to_string(),
+                source: Arc::from(err),
+            })?;
+        Ok(Some(Box::new(std::io::Cursor::new(bytes))))
     }
 }
 
@@ -131,17 +137,16 @@ impl DiskFileLoader {
     }
 }
 
-#[async_trait::async_trait]
 impl FileLoader for DiskFileLoader {
-    async fn load(
+    fn load(
         &self,
         path: &RepoPath,
-    ) -> Result<Option<Box<dyn AsyncRead + Send + Unpin>>, GitAttributesError> {
+    ) -> Result<Option<Box<dyn Read + Send>>, GitAttributesError> {
         let path = path
             .to_fs_path(&self.repo_root)
             .map_err(|err| GitAttributesError {
                 message: "Could not convert path into fs path".to_string(),
-                source: err.into(),
+                source: Arc::from(err),
             })?;
 
         // we use symlink_metadata to not follow symlinks to follow Git's behavior.
@@ -151,7 +156,7 @@ impl FileLoader for DiskFileLoader {
             Err(err) => {
                 return Err(GitAttributesError {
                     message: format!("Failed to obtain the file metadata of {}", path.display()),
-                    source: err.into(),
+                    source: Arc::from(err),
                 });
             }
         };
@@ -165,11 +170,11 @@ impl FileLoader for DiskFileLoader {
             Err(err) => {
                 return Err(GitAttributesError {
                     message: format!("Failed to open the file at {}", path.display()),
-                    source: err.into(),
+                    source: Arc::from(err),
                 });
             }
         };
-        Ok(Some(Box::new(BlockingAsyncReader::new(file))))
+        Ok(Some(Box::new(file)))
     }
 }
 
@@ -179,8 +184,8 @@ struct SearchAndCollection {
 }
 
 struct GitAttributesNode {
-    disk_first: OnceCell<Arc<SearchAndCollection>>,
-    store_first: OnceCell<Arc<SearchAndCollection>>,
+    disk_first: OnceLock<Result<Arc<SearchAndCollection>, GitAttributesError>>,
+    store_first: OnceLock<Result<Arc<SearchAndCollection>, GitAttributesError>>,
     disk_file_loader: Arc<dyn FileLoader>,
     store_file_loader: Arc<dyn FileLoader>,
     parent: Option<Arc<Self>>,
@@ -188,14 +193,17 @@ struct GitAttributesNode {
 }
 
 impl GitAttributesNode {
-    async fn get_disk_first(&self) -> Result<Arc<SearchAndCollection>, GitAttributesError> {
-        self.primary_then_secondary(SearchPriority::Disk).await
+    fn get_disk_first(&self) -> Result<Arc<SearchAndCollection>, GitAttributesError> {
+        self.primary_then_secondary(SearchPriority::Disk)
     }
-    async fn get_store_first(&self) -> Result<Arc<SearchAndCollection>, GitAttributesError> {
-        self.primary_then_secondary(SearchPriority::Store).await
+    fn get_store_first(&self) -> Result<Arc<SearchAndCollection>, GitAttributesError> {
+        self.primary_then_secondary(SearchPriority::Store)
     }
 
-    fn store(&self, priority: SearchPriority) -> &OnceCell<Arc<SearchAndCollection>> {
+    fn store(
+        &self,
+        priority: SearchPriority,
+    ) -> &OnceLock<Result<Arc<SearchAndCollection>, GitAttributesError>> {
         match priority {
             SearchPriority::Store => &self.store_first,
             SearchPriority::Disk => &self.disk_first,
@@ -216,15 +224,14 @@ impl GitAttributesNode {
         }
     }
 
-    async fn primary_then_secondary(
+    fn primary_then_secondary(
         &self,
         priority: SearchPriority,
     ) -> Result<Arc<SearchAndCollection>, GitAttributesError> {
         self.store(priority)
-            .get_or_try_init(async || {
+            .get_or_init(|| {
                 let parent_metadata = match &self.parent {
-                    // we use pin because this is a recursive call
-                    Some(parent) => Box::pin(parent.primary_then_secondary(priority)).await?,
+                    Some(parent) => parent.primary_then_secondary(priority)?,
                     None => {
                         let mut search = Search::default();
                         let mut collection = MetadataCollection::default();
@@ -244,21 +251,19 @@ impl GitAttributesNode {
                         .join(RepoPathComponent::new(".gitattributes").map_err(|err| {
                             GitAttributesError {
                                 message: "Could not join path with .gitattributes".to_string(),
-                                source: err.into(),
+                                source: Arc::from(err),
                             }
                         })?);
-                let mut async_reader = match self
+                let mut reader = match self
                     .primary_loader(priority)
-                    .load(&git_attributes_path)
-                    .await?
+                    .load(&git_attributes_path)?
                 {
                     Some(reader) => reader,
                     None => {
                         // fallback to the secondary loader
                         match self
                             .secondary_loader(priority)
-                            .load(&git_attributes_path)
-                            .await?
+                            .load(&git_attributes_path)?
                         {
                             Some(reader) => reader,
                             None => return Ok(parent_metadata),
@@ -266,13 +271,12 @@ impl GitAttributesNode {
                     }
                 };
                 let mut bytes = Vec::new();
-                async_reader
-                    .read_to_end(&mut bytes)
-                    .await
-                    .map_err(|err| GitAttributesError {
-                        source: err.into(),
+                reader.read_to_end(&mut bytes).map_err(|err| {
+                    GitAttributesError {
+                        source: Arc::from(err),
                         message: "Could not read .gitattributes file".into(),
-                    })?;
+                    }
+                })?;
                 let mut search = parent_metadata.search.clone();
                 let mut collection = parent_metadata.collection.clone();
 
@@ -283,7 +287,7 @@ impl GitAttributesNode {
                         .map_err(|err| GitAttributesError {
                             message: "Could not convert gitattributes path into PathBuf"
                                 .to_string(),
-                            source: err.into(),
+                            source: Arc::from(err),
                         })?,
                     Some(&PathBuf::new()),
                     &mut collection,
@@ -294,8 +298,7 @@ impl GitAttributesNode {
 
                 Ok(Arc::new(SearchAndCollection { search, collection }))
             })
-            .await
-            .cloned()
+            .clone()
     }
 }
 
@@ -319,16 +322,16 @@ impl GitAttributes {
         }
     }
 
-    pub(crate) async fn search(
+    pub(crate) fn search<'a>(
         &self,
         path: &RepoPath,
-        attribute_names: impl AsRef<[&str]>,
+        attribute_names: impl AsRef<[&'a str]>,
         priority: SearchPriority,
     ) -> Result<HashMap<String, State>, GitAttributesError> {
         let attributes = self.get_git_attributes_node(path);
         let store = match priority {
-            SearchPriority::Store => attributes.get_store_first().await?,
-            SearchPriority::Disk => attributes.get_disk_first().await?,
+            SearchPriority::Store => attributes.get_store_first()?,
+            SearchPriority::Disk => attributes.get_disk_first()?,
         };
         let SearchAndCollection { search, collection } = &*store;
 
@@ -378,8 +381,8 @@ impl GitAttributes {
         }
         let parent = path.parent().map(|parent| self.inner(map, parent));
         let new_node = Arc::new(GitAttributesNode {
-            disk_first: OnceCell::new(),
-            store_first: OnceCell::new(),
+            disk_first: OnceLock::new(),
+            store_first: OnceLock::new(),
             disk_file_loader: self.disk_file_loader.clone(),
             store_file_loader: self.store_file_loader.clone(),
             parent,
@@ -393,13 +396,13 @@ impl GitAttributes {
 impl GitAttributes {
     /// Returns whether the given `path` has a `filter` attribute in
     /// .gitattributes whose value is contained in `ignore_filters`.
-    pub(crate) async fn filter_matches(
+    pub(crate) fn filter_matches(
         &self,
         path: &RepoPath,
         ignore_filters: &HashSet<String>,
         priority: SearchPriority,
     ) -> bool {
-        let Ok(result) = self.search(path, ["filter"], priority).await else {
+        let Ok(result) = self.search(path, ["filter"], priority) else {
             return false;
         };
 
@@ -412,12 +415,12 @@ impl GitAttributes {
 }
 
 /// Errors for GitAttributes
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 pub struct GitAttributesError {
     message: String,
     #[source]
-    source: Box<dyn std::error::Error + Send + Sync>,
+    source: Arc<dyn std::error::Error + Send + Sync>,
 }
 
 #[cfg(test)]
@@ -427,18 +430,16 @@ mod tests {
 
     use gix_attributes::state::Value;
     use indoc::indoc;
-    use pollster::FutureExt as _;
 
     use super::*;
 
     type TestStore = HashMap<RepoPathBuf, Result<String, String>>;
 
-    #[async_trait::async_trait]
     impl FileLoader for TestStore {
-        async fn load(
+        fn load(
             &self,
             path: &RepoPath,
-        ) -> Result<Option<Box<dyn AsyncRead + Send + Unpin>>, GitAttributesError> {
+        ) -> Result<Option<Box<dyn Read + Send>>, GitAttributesError> {
             let Some(mocked_result) = self.get(path) else {
                 return Ok(None);
             };
@@ -447,7 +448,9 @@ mod tests {
                 Ok(data) => Ok(Some(Box::new(Cursor::new(Vec::from(data))))),
                 Err(message) => Err(GitAttributesError {
                     message: message.clone(),
-                    source: message.into(),
+                    source: Arc::from(
+                        Box::<dyn std::error::Error + Send + Sync>::from(message),
+                    ),
                 }),
             }
         }
@@ -490,7 +493,6 @@ mod tests {
     ) {
         let map = git_attributes
             .search(repo_path(file), &[attribute], search)
-            .block_on()
             .unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(*map.get(attribute).unwrap(), expected);
@@ -538,13 +540,13 @@ mod tests {
         // It's not 1:1 because we don't support $GIT_DIR/info/.gitattributes
         // that would override in-tree settings.
         let git_attributes = create_git_attributes(&[
-            (".gitattributes", "abc	foo bar baz"),
+            (".gitattributes", "abc\tfoo bar baz"),
             (
                 "t/.gitattributes",
                 indoc! {"
-                    ab*	merge=filfre
-                    abc	-foo -bar
-                    *.c	frotz
+                    ab*\tmerge=filfre
+                    abc\t-foo -bar
+                    *.c\tfrotz
                 "},
             ),
         ]);
@@ -593,7 +595,7 @@ mod tests {
     #[test]
     fn test_subdirectory_override() {
         let git_attributes = create_git_attributes(&[
-            (".gitattributes", "abc	!baz"),
+            (".gitattributes", "abc\t!baz"),
             ("t/.gitattributes", "abc baz"),
         ]);
         assert_search_output(&git_attributes, "t/abc", "baz", State::Set);
@@ -712,9 +714,7 @@ mod tests {
         )]);
 
         let git_attributes = GitAttributes::new(store, HashMap::new());
-        let result = &git_attributes
-            .search(repo_path("foo/bar.txt"), &["text"], SearchPriority::Disk)
-            .block_on();
+        let result = &git_attributes.search(repo_path("foo/bar.txt"), &["text"], SearchPriority::Disk);
         assert!(result.is_err());
         assert_eq!(
             &result.as_ref().unwrap_err().message,
@@ -729,13 +729,11 @@ mod tests {
         )]);
         let attributes = GitAttributes::new(HashMap::new(), data);
 
-        attributes
-            .filter_matches(
-                repo_path(path),
-                &HashSet::from(["lfs".to_string()]),
-                SearchPriority::Disk,
-            )
-            .block_on()
+        attributes.filter_matches(
+            repo_path(path),
+            &HashSet::from(["lfs".to_string()]),
+            SearchPriority::Disk,
+        )
     }
 
     #[test]
@@ -798,19 +796,17 @@ mod tests {
 
         let filters = &HashSet::from(["lfs".to_string(), "text".to_string()]);
         assert!(
-            attributes
-                .filter_matches(repo_path("file.bin"), filters, SearchPriority::Disk)
-                .block_on()
+            attributes.filter_matches(repo_path("file.bin"), filters, SearchPriority::Disk)
         );
         assert!(
-            attributes
-                .filter_matches(repo_path("subdir/file.txt"), filters, SearchPriority::Disk)
-                .block_on()
+            attributes.filter_matches(
+                repo_path("subdir/file.txt"),
+                filters,
+                SearchPriority::Disk
+            )
         );
         assert!(
-            !attributes
-                .filter_matches(repo_path("file.txt"), filters, SearchPriority::Disk)
-                .block_on()
+            !attributes.filter_matches(repo_path("file.txt"), filters, SearchPriority::Disk)
         ); // Not in subdir
     }
 
@@ -848,31 +844,23 @@ mod tests {
 
         // Test with lfs filter
         assert!(
-            attributes
-                .filter_matches(repo_path("file.bin"), filters, SearchPriority::Disk)
-                .block_on()
+            attributes.filter_matches(repo_path("file.bin"), filters, SearchPriority::Disk)
         );
         // Test with git-crypt filter
         assert!(
-            attributes
-                .filter_matches(
-                    repo_path("credentials.secret"),
-                    filters,
-                    SearchPriority::Disk
-                )
-                .block_on()
+            attributes.filter_matches(
+                repo_path("credentials.secret"),
+                filters,
+                SearchPriority::Disk
+            )
         );
         // Not In the filter
         assert!(
-            !attributes
-                .filter_matches(repo_path("file.bin2"), filters, SearchPriority::Disk)
-                .block_on()
+            !attributes.filter_matches(repo_path("file.bin2"), filters, SearchPriority::Disk)
         );
         // Test that other filters don't match
         assert!(
-            !attributes
-                .filter_matches(repo_path("file.txt"), filters, SearchPriority::Disk)
-                .block_on()
+            !attributes.filter_matches(repo_path("file.txt"), filters, SearchPriority::Disk)
         );
     }
 }
