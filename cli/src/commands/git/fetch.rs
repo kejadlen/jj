@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::io;
+use std::path::PathBuf;
+use std::process::Stdio;
 
 use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
@@ -130,6 +132,7 @@ pub async fn cmd_git_fetch(
     args: &GitFetchArgs,
 ) -> Result<(), CommandError> {
     let mut workspace_command = command.workspace_helper(ui)?;
+    let wc_root = workspace_command.workspace_root().to_owned();
     let remote_expr = if args.all_remotes {
         StringExpression::all()
     } else if let Some(remotes) = &args.remotes {
@@ -225,6 +228,20 @@ pub async fn cmd_git_fetch(
     }
 
     let git_settings = GitSettings::from_settings(tx.settings())?;
+    let remote_settings = tx.settings().remote_settings()?;
+    let lfs_git_context = git_settings
+        .ignore_filters
+        .iter()
+        .any(|filter| filter == "lfs")
+        .then(|| {
+            let git_backend = get_git_backend(tx.repo().store())?;
+            let git_worktree = git_backend
+                .git_workdir()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| wc_root.clone());
+            Ok::<_, CommandError>((git_backend.git_repo_path().to_owned(), git_worktree))
+        })
+        .transpose()?;
     let import_options = load_git_import_options(ui, &git_settings, &remote_settings)?;
     let mut git_fetch = GitFetch::new(
         tx.repo_mut(),
@@ -255,6 +272,33 @@ pub async fn cmd_git_fetch(
         ),
     )
     .await?;
+
+    // LFS runs after the transaction is committed so cancellation doesn't
+    // leave jj in a stale state (git refs are already persisted by this point).
+    if let Some((git_dir, git_worktree)) = lfs_git_context {
+        for remote in &matching_remotes {
+            std::process::Command::new("git-lfs")
+                .args(["fetch", remote.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .env("GIT_DIR", &git_dir)
+                .env("GIT_WORK_TREE", &git_worktree)
+                .current_dir(&git_worktree)
+                .status()
+                .ok();
+        }
+        std::process::Command::new("git-lfs")
+            .arg("checkout")
+            // Keep automatic checkout quiet for excluded/missing objects.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("GIT_DIR", &git_dir)
+            .env("GIT_WORK_TREE", &git_worktree)
+            .current_dir(&git_worktree)
+            .status()
+            .ok();
+    }
+
     Ok(())
 }
 

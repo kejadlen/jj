@@ -19,6 +19,7 @@ use testutils::git;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::fake_git_lfs_path;
 use crate::common::to_toml_value;
 
 fn git_repo_dir_for_jj_repo(work_dir: &TestWorkDir<'_>) -> std::path::PathBuf {
@@ -61,6 +62,21 @@ fn set_up(test_env: &TestEnvironment) {
             ],
         )
         .success();
+}
+
+fn set_up_fake_git_lfs(test_env: &mut TestEnvironment) -> std::path::PathBuf {
+    let fake_git_lfs = std::path::PathBuf::from(fake_git_lfs_path());
+    let fake_bin_dir = fake_git_lfs.parent().unwrap().to_owned();
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin_dir).chain(std::env::split_paths(&existing_path)),
+    )
+    .unwrap();
+    test_env.add_env_var("PATH", &path);
+    let log_path = test_env.env_root().join("fake_git_lfs.log");
+    std::fs::write(&log_path, "").unwrap();
+    test_env.add_env_var("FAKE_GIT_LFS_LOG", &log_path);
+    log_path
 }
 
 #[test]
@@ -2908,6 +2924,109 @@ fn test_git_push_rejected_by_remote() -> TestResult {
         ");
     });
     Ok(())
+}
+
+#[test]
+fn test_git_push_aborts_when_lfs_upload_fails() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "push");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "origin"])
+        .success();
+    let origin_dir = test_env.work_dir("origin");
+    origin_dir
+        .run_jj(["describe", "-m=description 1"])
+        .success();
+    origin_dir
+        .run_jj(["bookmark", "create", "-r@", "bookmark1"])
+        .success();
+    test_env
+        .run_jj_in(
+            ".",
+            [
+                "git",
+                "clone",
+                "--colocate",
+                "--config=remotes.origin.auto-track-bookmarks='*'",
+                "origin",
+                "local",
+            ],
+        )
+        .success();
+    let work_dir = test_env.work_dir("local");
+    work_dir.write_file(".git/lfs/objects/aa/bb/placeholder", "placeholder");
+    work_dir
+        .run_jj(["new", "bookmark1", "-m", "description 2"])
+        .success();
+    work_dir.write_file("file", "file");
+    work_dir.run_jj(["bookmark", "move", "bookmark1"]).success();
+
+    let output = work_dir.run_jj(["git", "push", "--bookmark", "bookmark1"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Changes to push to origin:
+      bookmark: bookmark1 [move forward from 9b2e76de3920 to d6221a0c2d80]
+    fake git-lfs: forced failure for subcommand `push`
+    Error: `git-lfs push` failed with exit status: 17; aborting push to avoid dangling LFS pointers
+    [EOF]
+    [exit status: 1]
+    ");
+
+    insta::assert_snapshot!(get_bookmark_output(&work_dir), @"
+    bookmark1: mzvwutvl d6221a0c description 2
+      @git: mzvwutvl d6221a0c description 2
+      @origin (behind by 1 commits): qpvuntsm 9b2e76de (empty) description 1
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_git_push_non_colocated_aborts_when_lfs_upload_fails() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    set_up(&test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "push");
+    let work_dir = test_env.work_dir("local");
+    let local_git_repo_path = git_repo_dir_for_jj_repo(&work_dir);
+    std::fs::create_dir_all(local_git_repo_path.join("lfs/objects/aa/bb")).unwrap();
+    work_dir.write_file(
+        ".jj/repo/store/git/lfs/objects/aa/bb/placeholder",
+        "placeholder",
+    );
+
+    work_dir
+        .run_jj(["new", "bookmark1", "-m", "description 2"])
+        .success();
+    work_dir.write_file("file", "file");
+    work_dir.run_jj(["bookmark", "move", "bookmark1"]).success();
+
+    let output = work_dir.run_jj(["git", "push", "--bookmark", "bookmark1"]);
+    assert!(
+        !output.status.success(),
+        "expected push to fail, got:\n{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("`git-lfs push` failed with exit status: 17; aborting push to avoid dangling LFS pointers"),
+        "expected `git-lfs push` failure message, got:\n{output}"
+    );
+    let bookmark_output = get_bookmark_output(&work_dir).stdout.into_raw();
+    assert!(
+        bookmark_output.contains("@origin (behind by 1 commits)"),
+        "origin bookmark should not have advanced:\n{bookmark_output}"
+    );
+
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.lines().any(|line| line.starts_with("push\t")),
+        "git-lfs push should have been invoked, but got:\n{log}"
+    );
 }
 
 #[test]

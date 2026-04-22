@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use indoc::indoc;
 use testutils::TestResult;
@@ -22,6 +23,7 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::create_commit;
+use crate::common::fake_git_lfs_path;
 
 fn add_commit_to_branch(git_repo: &gix::Repository, branch: &str, message: &str) -> gix::ObjectId {
     // Get current commit ID of the branch if it exists
@@ -117,6 +119,21 @@ fn clone_git_remote_into(
         .unwrap();
 
     fork_repo
+}
+
+fn set_up_fake_git_lfs(test_env: &mut TestEnvironment) -> PathBuf {
+    let fake_git_lfs = PathBuf::from(fake_git_lfs_path());
+    let fake_bin_dir = fake_git_lfs.parent().unwrap().to_owned();
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin_dir).chain(std::env::split_paths(&existing_path)),
+    )
+    .unwrap();
+    test_env.add_env_var("PATH", &path);
+    let log_path = test_env.env_root().join("fake_git_lfs.log");
+    std::fs::write(&log_path, "").unwrap();
+    test_env.add_env_var("FAKE_GIT_LFS_LOG", &log_path);
+    log_path
 }
 
 #[test]
@@ -2362,4 +2379,48 @@ fn test_git_fetch_auto_track_bookmarks() {
     bookmark: not-mine/foo@origin [new] untracked
     [EOF]
     ");
+}
+
+#[test]
+fn test_git_fetch_non_lfs_ignore_filter_does_not_run_git_lfs() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["git-crypt"]"#);
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+
+    work_dir.run_jj(["git", "fetch"]).success();
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.trim().is_empty(),
+        "git-lfs should not have been invoked, but got:\n{log}"
+    );
+}
+
+#[test]
+fn test_git_fetch_lfs_non_colocated_uses_git_context() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+
+    let output = work_dir.run_jj(["git", "fetch"]).success();
+    assert!(
+        output.stdout.raw().is_empty(),
+        "Unexpected stdout from `jj git fetch`:\n{}",
+        output.stdout.raw()
+    );
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.lines().any(|line| line.starts_with("fetch\t")),
+        "git-lfs fetch should have been invoked, but got:\n{log}"
+    );
+    assert!(
+        log.lines().any(|line| line.starts_with("checkout\t")),
+        "git-lfs checkout should have been invoked, but got:\n{log}"
+    );
 }
