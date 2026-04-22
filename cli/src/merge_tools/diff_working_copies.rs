@@ -289,6 +289,7 @@ diff editing in mind and be a little inaccurate.
                 base_ignores,
                 progress: None,
                 start_tracking_matcher: &EverythingMatcher,
+                snapshot_matcher: &EverythingMatcher,
                 force_tracking_matcher: &NothingMatcher,
                 max_new_file_size: u64::MAX,
             })

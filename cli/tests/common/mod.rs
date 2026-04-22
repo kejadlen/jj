@@ -39,6 +39,12 @@ pub fn fake_diff_editor_path() -> String {
     path.as_os_str().to_str().unwrap().to_owned()
 }
 
+pub fn fake_git_lfs_path() -> String {
+    let path = assert_cmd::cargo::cargo_bin!("git-lfs");
+    assert!(path.is_file());
+    path.as_os_str().to_str().unwrap().to_owned()
+}
+
 /// Forcibly enable interactive prompt.
 pub fn force_interactive(cmd: &mut assert_cmd::Command) -> &mut assert_cmd::Command {
     cmd.env("JJ_INTERACTIVE", "1")
