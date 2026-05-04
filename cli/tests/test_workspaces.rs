@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::PathBuf;
+
 use test_case::test_case;
 use testutils::TestResult;
 use testutils::git;
@@ -19,6 +21,22 @@ use testutils::git;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::fake_git_lfs_path;
+
+fn set_up_fake_git_lfs(test_env: &mut TestEnvironment) -> PathBuf {
+    let fake_git_lfs = PathBuf::from(fake_git_lfs_path());
+    let fake_bin_dir = fake_git_lfs.parent().unwrap().to_owned();
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin_dir).chain(std::env::split_paths(&existing_path)),
+    )
+    .unwrap();
+    test_env.add_env_var("PATH", &path);
+    let log_path = test_env.env_root().join("fake_git_lfs.log");
+    std::fs::write(&log_path, "").unwrap();
+    test_env.add_env_var("FAKE_GIT_LFS_LOG", &log_path);
+    log_path
+}
 
 #[test]
 fn test_workspaces_invalid_name() {
@@ -121,6 +139,32 @@ fn test_workspaces_add_second_and_third_workspace() {
     [exit status: 1]
     ");
     assert!(!test_env.env_root().join("tertiary").exists());
+}
+
+#[test]
+fn test_workspace_add_skips_lfs_checkout_when_objects_are_missing() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.run_jj_in(".", ["git", "init", "ws1"]).success();
+    let ws1_dir = test_env.work_dir("ws1");
+
+    ws1_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    for i in 0..128 {
+        ws1_dir.write_file(
+            &format!("unreal_exports/generated_asset_{i:04}.bin"),
+            format!("asset {i}\n"),
+        );
+    }
+    ws1_dir.run_jj(["commit", "-m", "seed"]).success();
+    std::fs::write(&fake_git_lfs_log_path, "").unwrap();
+
+    ws1_dir.run_jj(["workspace", "add", "../ws2"]).success();
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        !log.lines().any(|line| line.starts_with("checkout\t")),
+        "workspace add should avoid git-lfs checkout for missing local objects, but got:\n{log}"
+    );
 }
 
 #[test]
